@@ -18,6 +18,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 gtk = { package = "gtk4", version = "0.11", optional = true }
+libc = "0.2"
 rusqlite = "0.40"
 serde_json = "1"
 

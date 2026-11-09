@@ -112,6 +112,9 @@ impl Ui {
     }
     fn tick(&self) -> Result<()> {
         let now = now();
+        if let Some((away, end)) = self.store.catch_up(now, &Presence::current(false))? {
+            notify_away(away, end);
+        }
         let bar = self.store.bar(now)?;
         self.status.set_text(
             &bar["tooltip"]
@@ -258,7 +261,7 @@ fn build(app: &gtk::Application, path: &std::path::Path) -> Result<Rc<Ui>> {
     top.append(&toggle);
     top.append(&status);
     root.append(&top);
-    root.append(&label("Auto-pauses after 15 minutes of desktop inactivity. Resume manually when you return. Correct a session below if needed."));
+    root.append(&label("Pauses when idle, asleep, or shut down. Resume manually when you return. Correct a session below if needed."));
     let nav = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let period = gtk::DropDown::from_strings(&["Day", "Week", "Month"]);
     period.set_selected(1);

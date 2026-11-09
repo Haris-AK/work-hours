@@ -114,19 +114,116 @@ fn original_schema_is_reused() {
 #[test]
 fn idle_pause_is_atomic_idempotent_and_preserves_elapsed_time() {
     let (_dir, s) = store();
-    assert!(!s.pause_if_running(100.0).unwrap());
+    assert!(!s.pause_if_running(100.0, 0.0).unwrap());
     s.control("start", 100.0).unwrap();
-    assert!(s.pause_if_running(1000.0).unwrap());
+    assert!(s.pause_if_running(1000.0, 0.0).unwrap());
     assert!(s.active().unwrap().is_none());
-    assert!(!s.pause_if_running(2000.0).unwrap());
+    assert!(!s.pause_if_running(2000.0, 0.0).unwrap());
     let end: f64 =
         s.db.query_row("SELECT end FROM sessions WHERE id=1", [], |r| r.get(0))
             .unwrap();
     assert_eq!(end, 1000.0);
     s.control("start", 2100.0).unwrap();
-    assert!(s.pause_if_running(2000.0).unwrap()); // Clock moved backwards.
+    assert!(s.pause_if_running(2000.0, 0.0).unwrap()); // Clock moved backwards.
     let end: f64 =
         s.db.query_row("SELECT end FROM sessions WHERE id=2", [], |r| r.get(0))
             .unwrap();
     assert_eq!(end, 2100.0);
+}
+
+#[test]
+fn idle_pause_excludes_the_idle_period_but_not_time_before_the_start() {
+    let (_dir, s) = store();
+    s.control("start", 100.0).unwrap();
+    assert!(s.pause_if_running(2000.0, 900.0).unwrap());
+    s.control("start", 3000.0).unwrap();
+    assert!(s.pause_if_running(3500.0, 900.0).unwrap());
+    let ends: Vec<f64> =
+        s.db.prepare("SELECT end FROM sessions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+    assert_eq!(ends, vec![1100.0, 3000.0]);
+}
+
+fn here(boot: &str, slept: f64, login: Option<&str>) -> Presence {
+    Presence {
+        boot: boot.into(),
+        slept,
+        login: login.map(Into::into),
+    }
+}
+fn started(s: &Store, at: f64, presence: &Presence) {
+    s.db.execute("INSERT INTO sessions(start) VALUES (?)", [at])
+        .unwrap();
+    s.db.execute("DELETE FROM presence", []).unwrap();
+    assert_eq!(s.catch_up(at, presence).unwrap(), None);
+}
+fn end_of(s: &Store) -> Option<f64> {
+    s.db.query_row(
+        "SELECT end FROM sessions ORDER BY id DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn sleep_is_removed_and_the_timer_stays_paused_on_wake() {
+    let (_dir, s) = store();
+    started(&s, 1000.0, &here("a", 5.0, None));
+    assert_eq!(s.catch_up(1600.0, &here("a", 5.0, None)).unwrap(), None);
+    // Asleep for an hour, then woke 2 seconds before this poll.
+    let caught = s
+        .catch_up(1600.0 + 3602.0, &here("a", 3605.0, None))
+        .unwrap();
+    assert_eq!(caught, Some((Away::Asleep, 1602.0)));
+    assert!(s.active().unwrap().is_none());
+    assert_eq!(s.catch_up(9000.0, &here("a", 9000.0, None)).unwrap(), None);
+}
+
+#[test]
+fn short_suspends_and_a_stopped_bar_do_not_cut_sessions() {
+    let (_dir, s) = store();
+    started(&s, 1000.0, &here("a", 0.0, None));
+    assert_eq!(s.catch_up(1100.0, &here("a", 30.0, None)).unwrap(), None);
+    // No observations for hours (bar closed), but the computer stayed awake and logged in.
+    assert_eq!(s.catch_up(20000.0, &here("a", 30.0, None)).unwrap(), None);
+    assert!(s.active().unwrap().is_some());
+}
+
+#[test]
+fn restart_ends_at_the_last_observation() {
+    let (_dir, s) = store();
+    started(&s, 1000.0, &here("a", 0.0, None));
+    s.catch_up(1500.0, &here("a", 0.0, None)).unwrap();
+    s.catch_up(1505.0, &here("a", 0.0, None)).unwrap(); // Within the heartbeat interval.
+    let caught = s.catch_up(50000.0, &here("b", 0.0, None)).unwrap();
+    assert_eq!(caught, Some((Away::Restarted, 1500.0)));
+    assert_eq!(end_of(&s), Some(1500.0));
+}
+
+#[test]
+fn logout_is_detected_only_by_the_graphical_session() {
+    let (_dir, s) = store();
+    started(&s, 1000.0, &here("a", 0.0, None));
+    s.catch_up(1001.0, &here("a", 0.0, Some("3"))).unwrap();
+    // A terminal or SSH command reports no login and must not end the session.
+    assert_eq!(s.catch_up(1100.0, &here("a", 0.0, None)).unwrap(), None);
+    let caught = s.catch_up(5000.0, &here("a", 0.0, Some("7"))).unwrap();
+    assert_eq!(caught, Some((Away::LoggedOut, 1100.0)));
+}
+
+#[test]
+fn sessions_from_before_the_upgrade_are_adopted_not_cut() {
+    let (_dir, s) = store();
+    s.db.execute("INSERT INTO sessions(start) VALUES (100.0)", [])
+        .unwrap();
+    assert_eq!(
+        s.catch_up(90000.0, &here("z", 99999.0, None)).unwrap(),
+        None
+    );
+    assert!(s.active().unwrap().is_some());
 }

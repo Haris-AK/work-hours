@@ -126,7 +126,7 @@ fn idle_pause_notifies_only_when_a_running_timer_is_paused() {
     let idle = || {
         Tracker::checked(
             tracker
-                .command(&["idle-pause"])
+                .command(&["idle-pause", "--idle-for", "900"])
                 .env("PATH", &path)
                 .env("WORK_HOURS_NOTIFICATION_LOG", &log)
                 .output()
@@ -141,6 +141,13 @@ fn idle_pause_notifies_only_when_a_running_timer_is_paused() {
     let notification = fs::read_to_string(&log).unwrap();
     assert!(notification.contains("Work Hours paused"));
     assert!(notification.contains("No activity for 15 minutes."));
+    let (start, end): (f64, f64) = tracker
+        .connection()
+        .query_row("SELECT start,end FROM sessions", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(end, start); // Started under 15 minutes ago, so nothing is counted.
     idle();
     assert_eq!(fs::read_to_string(&log).unwrap(), notification);
 }

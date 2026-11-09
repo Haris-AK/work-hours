@@ -517,7 +517,7 @@ export default function WorkHours() {
             icon={data.running ? Icon.Play : Icon.Pause}
             detail={
               <List.Item.Detail
-                markdown={`# ${data.running ? "Working" : "Paused"}\n\n**${data.begin} — ${data.end}**\n\nTotal: **${duration(data.total_seconds)}**\n\nEnter to ${data.running ? "pause" : "start"}. Select a day to edit notes and sessions.\n\nAuto-pauses after 15 minutes of desktop inactivity. Start it again when you return.`}
+                markdown={`# ${data.running ? "Working" : "Paused"}\n\n**${data.begin} — ${data.end}**\n\nTotal: **${duration(data.total_seconds)}**\n\nEnter to ${data.running ? "pause" : "start"}. Select a day to edit notes and sessions.\n\nPauses when idle, asleep, or shut down. Start it again when you return.`}
               />
             }
             actions={

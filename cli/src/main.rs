@@ -35,6 +35,15 @@ struct Args {
     output: Option<PathBuf>,
     #[arg(long)]
     db: Option<PathBuf>,
+    /// For idle-pause: seconds the idle daemon waited, so that idle time is not counted.
+    #[arg(long, default_value_t = 0.0, value_parser = idle_seconds)]
+    idle_for: f64,
+}
+fn idle_seconds(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(s) if s.is_finite() && s >= 0.0 => Ok(s),
+        _ => Err("expected a non-negative number of seconds".into()),
+    }
 }
 fn run() -> Result<()> {
     let args = Args::parse();
@@ -46,7 +55,7 @@ fn run() -> Result<()> {
             .arg("--db")
             .arg(path)
             .status()
-            .context("Dashboard missing; run ./install.sh")?;
+            .context("Dashboard missing: install work-hours-dashboard next to work-hours (see the README)")?;
         if !status.success() {
             bail!("Dashboard exited with {status}");
         }
@@ -54,6 +63,10 @@ fn run() -> Result<()> {
     }
     let store = Store::open(&path)?;
     let now = now();
+    // Only the bar runs inside the graphical session, so only it can tell a logout happened.
+    if let Some((away, end)) = store.catch_up(now, &Presence::current(args.command == "bar"))? {
+        notify_away(away, end);
+    }
     let date = args.date.unwrap_or_else(today);
     match args.command.as_str() {
         "start" | "pause" | "toggle" => println!(
@@ -65,13 +78,17 @@ fn run() -> Result<()> {
             }
         ),
         "idle-pause" => {
-            if store.pause_if_running(now)? {
-                println!("Paused after 15 minutes without activity.");
-                let notification = Command::new("notify-send")
-                    .args(["--app-name=Work Hours", "--icon=media-playback-pause", "--urgency=normal",
-                        "Work Hours paused", "No activity for 15 minutes. Your timer is now paused. Start it again when you return to work."])
-                    .status();
-                if !matches!(notification, Ok(status) if status.success()) {
+            if store.pause_if_running(now, args.idle_for)? {
+                let idle = if args.idle_for > 0.0 {
+                    format!("No activity for {}", spoken(args.idle_for))
+                } else {
+                    "No activity".into()
+                };
+                println!("Paused: {}.", idle.to_lowercase());
+                let body = format!(
+                    "{idle}. Your timer is now paused. Start it again when you return to work."
+                );
+                if !notify("Work Hours paused", &body) {
                     eprintln!(
                         "work-hours: timer paused, but the desktop notification could not be delivered"
                     );

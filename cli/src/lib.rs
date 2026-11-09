@@ -25,6 +25,26 @@ pub struct Daily {
 pub struct Store {
     pub db: Connection,
 }
+/// Machine state that reveals time away from the computer between two observations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Presence {
+    /// Kernel boot ID; it changes after a shutdown or restart.
+    pub boot: String,
+    /// Seconds spent suspended or hibernated since boot.
+    pub slept: f64,
+    /// Login session ID, only reported by the bar, which lives in the graphical session.
+    pub login: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Away {
+    Asleep,
+    Restarted,
+    LoggedOut,
+}
+/// Suspends shorter than this (e.g. moving between rooms) keep the timer running.
+pub const MIN_SLEEP: f64 = 60.0;
+/// The heartbeat is written at most this often so the per-second bar poll rarely writes.
+pub const HEARTBEAT: f64 = 10.0;
 
 pub fn now() -> f64 {
     Utc::now().timestamp_micros() as f64 / 1_000_000.0
@@ -69,6 +89,64 @@ pub fn parse_time(text: &str) -> Result<f64> {
         .context("Ambiguous or nonexistent local time; include a UTC offset")?;
     Ok(t.timestamp() as f64)
 }
+/// "15 minutes", "1 minute", or "90 seconds" for notifications.
+pub fn spoken(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    let (n, unit) = if s.is_multiple_of(60) && s > 0 {
+        (s / 60, "minute")
+    } else {
+        (s, "second")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+/// Send a desktop notification; returns whether it was delivered.
+pub fn notify(summary: &str, body: &str) -> bool {
+    std::process::Command::new("notify-send")
+        .args([
+            "--app-name=Work Hours",
+            "--icon=media-playback-pause",
+            "--urgency=normal",
+            summary,
+            body,
+        ])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+pub fn notify_away(away: Away, end: f64) {
+    let at = local_time(end).format("%H:%M");
+    let why = match away {
+        Away::Asleep => "The computer was asleep",
+        Away::Restarted => "The computer was shut down or restarted",
+        Away::LoggedOut => "You logged out",
+    };
+    notify(
+        "Work Hours paused",
+        &format!("{why}, so the timer stopped at {at}. Start it again when you return to work."),
+    );
+}
+impl Presence {
+    pub fn current(login: bool) -> Self {
+        let clock = |id| {
+            let mut t = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `t` is a valid, writable timespec for the duration of the call.
+            unsafe { libc::clock_gettime(id, &mut t) };
+            t.tv_sec as f64 + t.tv_nsec as f64 / 1e9
+        };
+        Self {
+            boot: fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map(|id| id.trim().to_owned())
+                .unwrap_or_default(),
+            slept: clock(libc::CLOCK_BOOTTIME) - clock(libc::CLOCK_MONOTONIC),
+            login: login
+                .then(|| std::env::var("XDG_SESSION_ID").ok())
+                .flatten()
+                .filter(|id| !id.is_empty()),
+        }
+    }
+}
 pub fn duration(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     format!("{}h {:02}m {:02}s", s / 3600, s / 60 % 60, s % 60)
@@ -108,13 +186,20 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(10))?;
         // Preserve the original Python schema and timestamps. DDL only runs on first use.
-        if db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))? == 0 {
+        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version == 0 {
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY, start REAL NOT NULL, end REAL, deleted INTEGER NOT NULL DEFAULT 0, CHECK(end IS NULL OR end >= start));
                 CREATE UNIQUE INDEX IF NOT EXISTS one_running ON sessions((1)) WHERE end IS NULL AND deleted=0;
                 CREATE INDEX IF NOT EXISTS session_start ON sessions(start) WHERE deleted=0;
                 CREATE TABLE IF NOT EXISTS notes (day TEXT PRIMARY KEY, text TEXT NOT NULL);
                 PRAGMA user_version=1; COMMIT;")?;
+        }
+        if version < 2 {
+            // Last observation of the running session; sessions without one are never cut.
+            db.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS presence (session INTEGER PRIMARY KEY, seen REAL NOT NULL, boot TEXT NOT NULL, slept REAL NOT NULL, login TEXT);
+                PRAGMA user_version=2; COMMIT;")?;
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(Self { db })
@@ -148,6 +233,7 @@ impl Store {
             }
             None if action == "start" || action == "toggle" => {
                 tx.execute("INSERT INTO sessions(start) VALUES (?)", [now])?;
+                self.observe(tx.last_insert_rowid(), now, &Presence::current(false))?;
                 true
             }
             other => other.is_some(),
@@ -155,12 +241,58 @@ impl Store {
         tx.commit()?;
         Ok(running)
     }
-    /// Atomically pause only a running timer. Repeated idle events are silent.
-    pub fn pause_if_running(&self, now: f64) -> Result<bool> {
+    /// Atomically pause only a running timer, ending it `idle` seconds ago (never before it
+    /// started). Repeated idle events are silent.
+    pub fn pause_if_running(&self, now: f64, idle: f64) -> Result<bool> {
         Ok(self.db.execute(
             "UPDATE sessions SET end=MAX(start,?) WHERE end IS NULL AND deleted=0",
-            [now],
+            [now - idle.max(0.0)],
         )? > 0)
+    }
+    fn observe(&self, session: i64, now: f64, here: &Presence) -> Result<()> {
+        self.db.execute("INSERT INTO presence VALUES (?,?,?,?,?) ON CONFLICT(session) DO UPDATE SET seen=excluded.seen, boot=excluded.boot, slept=excluded.slept, login=COALESCE(excluded.login, login)", params![session, now, here.boot, here.slept, here.login])?;
+        self.db
+            .execute("DELETE FROM presence WHERE session != ?", [session])?;
+        Ok(())
+    }
+    /// Stop a running session at the point the computer went to sleep, shut down, or the user
+    /// logged out, judged against its last recorded presence. Otherwise refresh that record.
+    pub fn catch_up(&self, now: f64, here: &Presence) -> Result<Option<(Away, f64)>> {
+        let Some(active) = self.active()? else {
+            return Ok(None);
+        };
+        let last: Option<(f64, String, f64, Option<String>)> = self
+            .db
+            .prepare_cached("SELECT seen,boot,slept,login FROM presence WHERE session=?")?
+            .query_row([active.id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?;
+        let Some((seen, boot, slept, login)) = last else {
+            return self.observe(active.id, now, here).map(|_| None);
+        };
+        let away = if boot != here.boot {
+            Some((Away::Restarted, seen))
+        } else if here.slept - slept >= MIN_SLEEP {
+            // Awake time since the last observation still counts; only the sleep is removed.
+            Some((Away::Asleep, (now - (here.slept - slept)).clamp(seen, now)))
+        } else if login.is_some() && here.login.is_some() && login != here.login {
+            Some((Away::LoggedOut, seen))
+        } else {
+            None
+        };
+        if let Some((why, end)) = away {
+            let end = end.max(active.start);
+            let changed = self.db.execute(
+                "UPDATE sessions SET end=? WHERE id=? AND end IS NULL",
+                params![end, active.id],
+            )?;
+            return Ok((changed > 0).then_some((why, end)));
+        }
+        if now - seen >= HEARTBEAT || (login.is_none() && here.login.is_some()) {
+            self.observe(active.id, now, here)?;
+        }
+        Ok(None)
     }
     pub fn save_session(&self, start: f64, end: f64, id: Option<i64>, now: f64) -> Result<()> {
         if !start.is_finite() || !end.is_finite() || end <= start {
@@ -316,7 +448,7 @@ impl Store {
         let running = self.active()?.is_some();
         let day_total = total(today, next(today));
         Ok(
-            serde_json::json!({"text": format!("{} {} · {}", if running {"▶"} else {"Ⅱ"}, if running {"Working"} else {"Paused"}, duration(day_total)), "class": if running {"running"} else {"paused"}, "tooltip": format!("{}\nToday: {}\nWeek: {}\nMonth: {}\nAuto-pause: after 15 minutes idle · Resume manually\nClick: start/pause · Right-click: history and notes", if running {"Working"} else {"Paused"}, duration(day_total), duration(total(week,week_end)), duration(total(month,month_end)))}),
+            serde_json::json!({"text": format!("{} {} · {}", if running {"▶"} else {"Ⅱ"}, if running {"Working"} else {"Paused"}, duration(day_total)), "class": if running {"running"} else {"paused"}, "tooltip": format!("{}\nToday: {}\nWeek: {}\nMonth: {}\nClick: start/pause · Right-click: history and notes", if running {"Working"} else {"Paused"}, duration(day_total), duration(total(week,week_end)), duration(total(month,month_end)))}),
         )
     }
     pub fn export(&self, target: &Path, start: Day, end: Day, kind: &str, now: f64) -> Result<()> {

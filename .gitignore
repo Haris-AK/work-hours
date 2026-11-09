@@ -2,3 +2,7 @@ cli/target/
 vicinae/node_modules/
 vicinae/dist/
 vicinae/vicinae-env.d.ts
+*.sqlite3
+.DS_Store
+.idea/
+.vscode/

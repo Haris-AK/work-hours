@@ -66,7 +66,7 @@ export function createBackend(
       throw new Error(
         e.stderr?.trim().replace(/^work-hours: /, "") ||
           (e.code === "ENOENT"
-            ? "Work Hours is not installed. Run ./install.sh."
+            ? "Work Hours is not installed at ~/.local/bin/work-hours. See the README."
             : "Work Hours command failed."),
       );
     }
