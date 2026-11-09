@@ -1,0 +1,32 @@
+[package]
+name = "work-hours"
+version = "0.1.0"
+edition = "2024"
+default-run = "work-hours"
+
+[features]
+dashboard = ["dep:gtk"]
+
+[[bin]]
+name = "work-hours-dashboard"
+path = "src/bin/work-hours-dashboard.rs"
+required-features = ["dashboard"]
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+gtk = { package = "gtk4", version = "0.11", optional = true }
+rusqlite = "0.40"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+
+[[bench]]
+name = "bar_poll"
+harness = false

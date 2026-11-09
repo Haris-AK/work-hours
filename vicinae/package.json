@@ -1,0 +1,45 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "work-hours",
+  "title": "Work Hours",
+  "description": "Track work, edit daily notes and sessions, and export timesheets using the local Rust tracker.",
+  "icon": "icon.svg",
+  "author": "hak",
+  "license": "MIT",
+  "categories": [
+    "Productivity"
+  ],
+  "commands": [
+    {
+      "name": "work-hours",
+      "title": "Work Hours \u2014 Manage Timer and History",
+      "description": "Start or pause work, edit notes and sessions, and export daily or session CSVs.",
+      "mode": "view",
+      "keywords": [
+        "timesheet",
+        "timer",
+        "part time",
+        "notes",
+        "hours"
+      ]
+    }
+  ],
+  "scripts": {
+    "build": "vici build",
+    "dev": "vici develop",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/backend.test.ts",
+    "format": "prettier --write src package.json tsconfig.json"
+  },
+  "dependencies": {
+    "@vicinae/api": "0.29.1",
+    "react": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "prettier": "^3.9.10",
+    "tsx": "^4",
+    "typescript": "^5.9"
+  }
+}
